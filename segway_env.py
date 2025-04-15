@@ -1,5 +1,5 @@
-import math
 import time
+
 # /home/rdarder/dev/balancing-robot/segway_env.py
 import gymnasium as gym
 import numpy as np
@@ -7,7 +7,7 @@ import pybullet as p
 import pybullet_data
 from gymnasium import spaces
 
-from pybullet_utils import JointsByName
+from pybullet_utils import JointsByName, LinksByName
 
 
 class SegwayEnv(gym.Env):
@@ -17,30 +17,32 @@ class SegwayEnv(gym.Env):
     }
 
     MAX_SPEED = 1.5  # m/s
+    MAX_ROLL_RATE = 3.0  # rad/s
 
     # --- Motor & Gearbox Parameters ---
     MOTOR_MAX_VOLTAGE = 3.7
     MOTOR_RESISTANCE = 3.0  # ohms per phase
     MOTOR_STALL_TORQUE = 0.00196  # 20 g/cm
-    GEAR_RATIO = 10.0
+    GEAR_RATIO = 37.0 / 8
     MOTOR_KE = 0.00707
     MOTOR_KT = 0.00159
     OUTPUT_STALL_TORQUE = MOTOR_STALL_TORQUE * GEAR_RATIO
 
     # --- Weights for reward components ---
-    W_UPRIGHT = 0.2
-    W_SPEED = 0.6
-    W_TURN = 0.2
+    W_UPRIGHT = 0.35
+    W_SPEED = 0.3
+    W_TURN = 0.3
+    W_BALANCE = 0.05
 
     # --- Noise Parameters (for Domain Randomization) ---
-    ANGLE_NOISE_STD_DEV_PITCH_ROLL = np.radians(0.25)
-    ANGLE_NOISE_STD_DEV_YAW = np.radians(0.5)
+    ANGLE_NOISE_STD_DEV_PITCH_ROLL = np.radians(0.1)
+    ANGLE_NOISE_STD_DEV_YAW = np.radians(0.2)
     # ---
     #
     ACTION_LOW = -1.0
     ACTION_HIGH = 1.0
 
-    def __init__(self, render_mode: str="direct", is_real_time: bool=False):
+    def __init__(self, render_mode: str = "direct", is_real_time: bool = False):
         super().__init__()
 
         self._client_id = self._connect_pybullet(render_mode)
@@ -53,7 +55,9 @@ class SegwayEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
         )
         # Action: [left_pwm, right_pwm] (normalized between -1 and 1)
-        self.action_space = spaces.Box(low=self.ACTION_LOW, high=self.ACTION_HIGH, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=self.ACTION_LOW, high=self.ACTION_HIGH, shape=(2,), dtype=np.float32
+        )
 
         # Internal state variables
         self._prev_vel = np.zeros(3)
@@ -75,8 +79,10 @@ class SegwayEnv(gym.Env):
             physicsClientId=self._client_id,
         )
         self.joints = JointsByName(self.segway_id, self._client_id)
+        self.links = LinksByName(self.segway_id, self._client_id)
         self.left_wheel_joint = self.joints.by_name("left_drive")
         self.right_wheel_joint = self.joints.by_name("right_drive")
+        self.imu_link = self.links.by_name("imu")
 
         self._unlock_motors()
 
@@ -192,36 +198,57 @@ class SegwayEnv(gym.Env):
             )
 
     def _get_obs(self):
-        """Constructs the observation vector, adding noise to orientation."""
-        sim_pos, sim_orientation_quat = p.getBasePositionAndOrientation(
-            self.segway_id, physicsClientId=self._client_id
-        )
-        sim_velocity, sim_angular_velocity = p.getBaseVelocity(
-            self.segway_id, physicsClientId=self._client_id
+        """Constructs the observation vector using data from the IMU link."""
+        # Get IMU link state
+        imu_state = p.getLinkState(
+            self.segway_id,
+            self.imu_link,
+            computeLinkVelocity=1,  # Need to compute velocities
+            physicsClientId=self._client_id,
         )
 
+        # Extract position, orientation, and velocities
+        sim_orientation_quat = imu_state[1]  # world orientation
+        sim_velocity = imu_state[6]  # linear velocity
+        sim_angular_velocity = imu_state[7]  # angular velocity
+
+        # Convert to IMU readings
         imu_angular_velocity = sim_angular_velocity
         imu_velocity = np.array(sim_velocity)
 
-        # Calculate acceleration, handle potential division by zero if time_step is invalid
-        if self.time_step > 1e-9:
-            imu_accel = (imu_velocity - self.prev_vel) / self.time_step
-        else:
-            imu_accel = np.zeros(3)
+        # Calculate acceleration
+        imu_accel = (imu_velocity - self.prev_vel) / self.time_step
         self.prev_vel = (
             imu_velocity  # Store current velocity for next step's calculation
         )
 
-        # Add gravity component to accelerometer Z reading (IMUs measure proper acceleration)
-        # Assuming Z is up, gravity is -9.81. IMU measures reaction force, so +9.81.
-        imu_accel[2] += 9.81
+        # Add gravity component to accelerometer Z reading
+        # Transform gravity vector from world frame to IMU frame
+        gravity_world = np.array([0, 0, 9.81])  # Gravity in world frame (positive Z up)
+
+        # Convert orientation quaternion to rotation matrix
+        rot_matrix = p.getMatrixFromQuaternion(sim_orientation_quat)
+        rot_matrix = np.array(rot_matrix).reshape(3, 3)
+
+        # Transpose rotation matrix to convert from world to IMU frame
+        rot_matrix_transposed = rot_matrix.T
+
+        # Transform gravity to IMU frame and add to acceleration
+        gravity_imu = rot_matrix_transposed.dot(gravity_world)
+        imu_accel += gravity_imu
+
+        # Get orientation as Euler angles
         imu_orientation = p.getEulerFromQuaternion(sim_orientation_quat)
 
         # --- Control Targets ---
-        # Ensure targets are clipped just in case they were set externally without clipping
-        clipped_target_speed = np.clip(self.target_speed, -self.MAX_SPEED, self.MAX_SPEED)
+        # Ensure targets are clipped
+        clipped_target_speed = np.clip(
+            self.target_speed, -self.MAX_SPEED, self.MAX_SPEED
+        )
         clipped_target_turn = np.clip(self.target_turn, -1.0, 1.0)
-        targets = np.array([clipped_target_speed, clipped_target_turn], dtype=np.float32)
+        targets = np.array(
+            [clipped_target_speed, clipped_target_turn], dtype=np.float32
+        )
 
         # --- Concatenate Observation ---
         # Order: IMU accel (3), IMU angular velocity (3), Noisy Fused Angles (Roll, Pitch, Yaw) (3), Targets (2) = 11 elements
@@ -230,6 +257,7 @@ class SegwayEnv(gym.Env):
             dtype=np.float32,
         )
 
+        # Add sensor noise
         noisy_observation = ideal_observation * np.random.normal(
             1.0, 0.04, size=ideal_observation.shape
         )
@@ -299,7 +327,6 @@ class SegwayEnv(gym.Env):
             physicsClientId=self._client_id,
         )
 
-
     def step(self, action):
         # Clip action just in case it's outside the [-1, 1] range
         action = np.clip(action, self.ACTION_LOW, self.ACTION_HIGH)
@@ -319,11 +346,15 @@ class SegwayEnv(gym.Env):
             self.segway_id, physicsClientId=self._client_id
         )
 
-        reward_components = self._compute_reward(velocities, angular_velocities, position_quat, orientation_quat)
+        reward_components = self._compute_reward(
+            velocities, angular_velocities, position_quat, orientation_quat
+        )
         total_reward = reward_components["total_reward"]
         terminated = self._check_termination(orientation_quat)
         truncated = self.step_count >= 2400
-        info = self._make_info(reward_components, action, [left_final_torque, right_final_torque])
+        info = self._make_info(
+            reward_components, action, [left_final_torque, right_final_torque]
+        )
         p.stepSimulation(self._client_id)
         self._sleep_if_real_time()
 
@@ -336,7 +367,6 @@ class SegwayEnv(gym.Env):
                 time.sleep(self.time_step - elapsed)
             self._last_step_timestamp = time.time()
 
-
     def _check_termination(self, orientation_quat):
         """Checks if the episode should terminate due to falling."""
         ax, ay, az = p.getEulerFromQuaternion(orientation_quat)
@@ -348,21 +378,35 @@ class SegwayEnv(gym.Env):
         fell_over = self.step_count > grace_period_steps and abs(ax) > fall_threshold
         return fell_over
 
-    def _compute_reward(self, velocities, angular_velocities, position_quat, orientation_quat):
-        """Computes the reward based on uprightness, speed tracking, and turn tracking."""
+    def _compute_reward(
+        self, velocities, angular_velocities, position_quat, orientation_quat
+    ):
+        """Computes the reward based on uprightness, speed tracking, turn tracking, and balance stability."""
 
-        tx, ty, tz  = angular_velocities
+        tx, ty, tz = angular_velocities
         ox, oy, oz = p.getEulerFromQuaternion(orientation_quat)
         vx, vy, vz = velocities
 
-        orientation_inv = p.invertTransform([0,0,0], orientation_quat)[1]
-        local_vel = p.multiplyTransforms([0,0,0], orientation_inv, velocities, [0,0,0,1])[0]
+        orientation_inv = p.invertTransform([0, 0, 0], orientation_quat)[1]
+        local_vel = p.multiplyTransforms(
+            [0, 0, 0], orientation_inv, velocities, [0, 0, 0, 1]
+        )[0]
         forward_speed = local_vel[1]  # y component is forward
+
+        # Transform angular velocities to local frame
+        local_angular_vel = p.multiplyTransforms(
+            [0, 0, 0], orientation_inv, angular_velocities, [0, 0, 0, 1]
+        )[0]
+        local_tx = local_angular_vel[
+            0
+        ]  # Local x-axis angular velocity (rolling oscillation)
 
         target_speed = np.clip(self.target_speed, -self.MAX_SPEED, self.MAX_SPEED)
 
         # First check if the signs match (going in the right direction)
-        same_direction = (forward_speed * target_speed >= 0) or (abs(forward_speed) < 0.05)
+        same_direction = (forward_speed * target_speed >= 0) or (
+            abs(forward_speed) < 0.05
+        )
 
         # Base error is still the absolute difference
         speed_error = abs(forward_speed - target_speed)
@@ -380,10 +424,8 @@ class SegwayEnv(gym.Env):
         # Reward for staying upright (cosine function of pitch)
         # Max angle considered 'stable' for reward calculation (e.g., +/- 90 degrees)
         horizontal_pitch = np.pi / 2.0
-        # Cosine reward: 1 when upright (pitch=0), 0 at max_stable_pitch, negative beyond
-        upright_reward_raw = (
-            np.cos(ox) if abs(ox) < horizontal_pitch else -1.0
-        )
+        # Cosine reward: 1 when upright (pitch=0), 0 at max_stable_pitch and beyond.
+        upright_reward_raw = np.cos(ox) if abs(ox) < horizontal_pitch else 0.0
 
         # --- Turn Tracking Reward ---
         # Target turn rate is self.target_turn (normalized, e.g., [-1, 1])
@@ -399,12 +441,18 @@ class SegwayEnv(gym.Env):
         # Adjust scaling factor (e.g., 1.0) and normalization
         turn_reward_raw = np.exp(-1.0 * turn_error / max_expected_turn_rate)
 
+        # --- Balance Stability Reward ---
+        # Penalize oscillations in roll (angular velocity around local x-axis)  # rad/s - adjust based on expected behavior
+        roll_rate = abs(local_tx)
+        balance_reward_raw = np.exp(-10.0 * roll_rate / self.MAX_ROLL_RATE)
+
         # --- Combine Rewards with Weights ---
         upright_reward = self.W_UPRIGHT * upright_reward_raw
         speed_reward = self.W_SPEED * speed_reward_raw
         turn_reward = self.W_TURN * turn_reward_raw
+        balance_reward = self.W_BALANCE * balance_reward_raw
 
-        total_reward = upright_reward + speed_reward + turn_reward
+        total_reward = upright_reward + speed_reward + turn_reward + balance_reward
 
         # Return dictionary including components for logging/info
         return {
@@ -415,9 +463,12 @@ class SegwayEnv(gym.Env):
             "turn_reward": turn_reward,
             "upright_reward_raw": upright_reward_raw,
             "upright_reward": upright_reward,
+            "balance_reward_raw": balance_reward_raw,
+            "balance_reward": balance_reward,
             "forward_speed": forward_speed,
             "turn": tz,
-            "upright_angle": ox
+            "upright_angle": ox,
+            "roll_rate": roll_rate,
         }
 
     def _make_info(self, reward_components, pwm, torque):
@@ -429,14 +480,13 @@ class SegwayEnv(gym.Env):
             "torque_L": torque[0],
             "torque_R": torque[1],
             "pwm_L": pwm[0],
-            "pwm_R": pwm[1]
+            "pwm_R": pwm[1],
         }
 
         # Add reward components if available
         if reward_components:
             info.update(reward_components)  # Add all keys from the reward dict
         return info
-
 
     def close(self):
         """Closes the environment and disconnects from PyBullet."""

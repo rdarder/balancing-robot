@@ -1,6 +1,6 @@
-import sys
 import glob
 import os
+import sys
 import time
 
 import pybullet as p
@@ -39,7 +39,7 @@ class DebugSegwayEnv(SegwayEnv):
     def step(self, action):
         observation, reward, terminated, done, info = super().step(action)
         self._camera_follows_segway()
-        if self.step_count % 240 == 0:
+        if self.step_count % 24 == 0:
             self._print_debug_info(info)
         return observation, reward, terminated, False, info
 
@@ -92,8 +92,21 @@ class DebugSegwayEnv(SegwayEnv):
             fmt(self.W_UPRIGHT),
             fmt(rad2deg(info["upright_angle"])),
         )
+        rewards.add_row(
+            "balance",
+            fmt(info["balance_reward"]),
+            fmt(info["balance_reward_raw"]),
+            fmt(self.W_BALANCE),
+            fmt(rad2deg(info["roll_rate"])),
+            fmt(rad2deg(self.MAX_ROLL_RATE)),
+        )
 
         pose = Table(title="Extra", show_header=True)
+        pose.add_column("left", style="dim")
+        pose.add_column("right", style="dim")
+
+        pose.add_row(fmt(info["pwm_L"]), fmt(info["pwm_R"]))
+        pose.add_row(fmt(info["torque_L"]), fmt(info["torque_R"]))
 
         layout = Layout()
         layout.split_row(Layout(rewards), Layout(pose))

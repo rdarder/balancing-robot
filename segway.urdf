@@ -93,7 +93,7 @@
     </joint>
 
     <!-- IMU LINK -->
-    <link name="imu_link">
+    <link name="imu">
         <inertial>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <mass value="0.002" />
@@ -112,7 +112,7 @@
     </link>
     <joint name="imu_joint" type="fixed">
         <parent link="chassis" />
-        <child link="imu_link" />
+        <child link="imu" />
         <origin xyz="0 0 0.035" rpy="0 0 0" />
     </joint>
 

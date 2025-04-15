@@ -1,5 +1,7 @@
-import pybullet as p
 from typing import Iterable
+
+import pybullet as p
+
 
 class JointsByName:
     """Utility for accessing joint IDs by name in a PyBullet model."""
@@ -27,14 +29,55 @@ class JointsByName:
         return joint_map
 
 
+class LinksByName:
+    def __init__(self, model_id: int, client_id: int):
+        self._model_id = model_id
+        self._client_id = client_id
+        self.link_ids_by_name = self._make_link_ids_by_name()
+
+    def _make_link_ids_by_name(self):
+        link_map = {}
+        for i in range(p.getNumJoints(self._model_id, self._client_id)):
+            joint_info = p.getJointInfo(self._model_id, i, self._client_id)
+            link_name = joint_info[12].decode("utf-8")
+            link_id = joint_info[0]  # apparently joints share ids with links ?
+            link_map[link_name] = link_id
+        return link_map
+
+    def by_name(self, link_name: str) -> int:
+        return self.link_ids_by_name[link_name]
+
+
 def get_non_fixed_joint_ids(model_id: int, client_id: int) -> Iterable[int]:
     for i in range(p.getNumJoints(model_id, client_id)):
         joint_info = p.getJointInfo(model_id, i, client_id)
         if joint_info[2] != p.JOINT_FIXED:
             yield joint_info[0]
 
+
 def add_debug_lines(joint_id: int, model_id: int, client_id: int):
     print(joint_id)
-    p.addUserDebugLine([0, 0, 0], [1, 0, 0], [1, 0, 0], parentLinkIndex=joint_id , parentObjectUniqueId=model_id, physicsClientId=client_id)  # X axis (red)
-    p.addUserDebugLine([0, 0, 0], [0, 1, 0], [0, 1, 0], parentLinkIndex=joint_id, parentObjectUniqueId=model_id, physicsClientId=client_id)  # Y axis (green)
-    p.addUserDebugLine([0, 0, 0], [0, 0, 1], [0, 0, 1], parentLinkIndex=joint_id, parentObjectUniqueId=model_id, physicsClientId=client_id)  # Z axis (blue)
+    p.addUserDebugLine(
+        [0, 0, 0],
+        [1, 0, 0],
+        [1, 0, 0],
+        parentLinkIndex=joint_id,
+        parentObjectUniqueId=model_id,
+        physicsClientId=client_id,
+    )  # X axis (red)
+    p.addUserDebugLine(
+        [0, 0, 0],
+        [0, 1, 0],
+        [0, 1, 0],
+        parentLinkIndex=joint_id,
+        parentObjectUniqueId=model_id,
+        physicsClientId=client_id,
+    )  # Y axis (green)
+    p.addUserDebugLine(
+        [0, 0, 0],
+        [0, 0, 1],
+        [0, 0, 1],
+        parentLinkIndex=joint_id,
+        parentObjectUniqueId=model_id,
+        physicsClientId=client_id,
+    )  # Z axis (blue)
