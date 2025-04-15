@@ -1,0 +1,6 @@
+venv
+tensorboard_logs
+checkpoints
+**/__pycache__
+recorded_videos
+mujoco-backup
