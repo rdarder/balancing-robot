@@ -1,5 +1,6 @@
+import math
 import time
-
+from collections import deque
 # /home/rdarder/dev/balancing-robot/segway_env.py
 import gymnasium as gym
 import numpy as np
@@ -29,10 +30,10 @@ class SegwayEnv(gym.Env):
     OUTPUT_STALL_TORQUE = MOTOR_STALL_TORQUE * GEAR_RATIO
 
     # --- Weights for reward components ---
-    W_UPRIGHT = 0.35
+    W_UPRIGHT = 0.1
     W_SPEED = 0.3
     W_TURN = 0.3
-    W_BALANCE = 0.05
+    W_BALANCE = 0.3
 
     # --- Noise Parameters (for Domain Randomization) ---
     ANGLE_NOISE_STD_DEV_PITCH_ROLL = np.radians(0.1)
@@ -41,6 +42,7 @@ class SegwayEnv(gym.Env):
     #
     ACTION_LOW = -1.0
     ACTION_HIGH = 1.0
+    FRAME_STACK_SIZE = 8
 
     def __init__(self, render_mode: str = "direct", is_real_time: bool = False):
         super().__init__()
@@ -52,7 +54,7 @@ class SegwayEnv(gym.Env):
         # --- Spaces and State ---
         # Observation: [ax, ay, az, gx, gy, gz, pitch_noisy, roll_noisy, yaw_noisy, target_speed, target_turn]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.FRAME_STACK_SIZE, 8), dtype=np.float32
         )
         # Action: [left_pwm, right_pwm] (normalized between -1 and 1)
         self.action_space = spaces.Box(
@@ -64,6 +66,8 @@ class SegwayEnv(gym.Env):
         self.target_speed = 0.0  # Target forward/backward speed command
         self.target_turn = 0.0  # Target turning rate command
         self.step_count = 0
+        # the stack should behave like a ring buffer of size self.FRAME_STACK_SIZE
+        self._observation_stack = deque(maxlen=self.FRAME_STACK_SIZE)
 
     def _load_model(self):
         self._plane_id = p.loadURDF("plane.urdf", physicsClientId=self._client_id)
@@ -163,7 +167,11 @@ class SegwayEnv(gym.Env):
         self.target_turn = self._get_initial_target_turn(options)
         self._last_step_timestamp = time.time()
         observation = self._get_obs()  # Get initial info dictionary
-        return observation, {}
+        self._observation_stack.clear()  # Clear any previous data
+        for _ in range(self.FRAME_STACK_SIZE):
+            self._observation_stack.append(observation)
+
+        return np.array(list(self._observation_stack)), {}
 
     def _get_initial_target_turn(self, options):
         if options and "target_turn" in options:
@@ -237,9 +245,6 @@ class SegwayEnv(gym.Env):
         gravity_imu = rot_matrix_transposed.dot(gravity_world)
         imu_accel += gravity_imu
 
-        # Get orientation as Euler angles
-        imu_orientation = p.getEulerFromQuaternion(sim_orientation_quat)
-
         # --- Control Targets ---
         # Ensure targets are clipped
         clipped_target_speed = np.clip(
@@ -253,13 +258,13 @@ class SegwayEnv(gym.Env):
         # --- Concatenate Observation ---
         # Order: IMU accel (3), IMU angular velocity (3), Noisy Fused Angles (Roll, Pitch, Yaw) (3), Targets (2) = 11 elements
         ideal_observation = np.concatenate(
-            [imu_accel, imu_angular_velocity, imu_orientation, targets],
+            [imu_accel, imu_angular_velocity, targets],
             dtype=np.float32,
         )
 
         # Add sensor noise
         noisy_observation = ideal_observation * np.random.normal(
-            1.0, 0.04, size=ideal_observation.shape
+            1.0, 0.1, size=ideal_observation.shape
         )
         return noisy_observation
 
@@ -337,7 +342,7 @@ class SegwayEnv(gym.Env):
         self._apply_torque(self.left_wheel_joint, left_final_torque)
         self._apply_torque(self.right_wheel_joint, right_final_torque)
         self.step_count += 1
-        observation = self._get_obs()  # Gets observation with noisy angles
+        self._observation_stack.append(self._get_obs())
 
         velocities, angular_velocities = p.getBaseVelocity(
             self.segway_id, physicsClientId=self._client_id
@@ -358,6 +363,7 @@ class SegwayEnv(gym.Env):
         p.stepSimulation(self._client_id)
         self._sleep_if_real_time()
 
+        observation = np.array(list(self._observation_stack))
         return observation, total_reward, terminated, truncated, info
 
     def _sleep_if_real_time(self):
@@ -374,7 +380,7 @@ class SegwayEnv(gym.Env):
         # Check pitch angle for falling over
         fall_threshold = np.radians(100.0)  # e.g., 100 degrees
         # Add a grace period at the start of the episode before checking fall condition
-        grace_period_steps = 30
+        grace_period_steps = 40
         fell_over = self.step_count > grace_period_steps and abs(ax) > fall_threshold
         return fell_over
 
@@ -401,31 +407,32 @@ class SegwayEnv(gym.Env):
             0
         ]  # Local x-axis angular velocity (rolling oscillation)
 
+        max_angle_for_full_reward = np.radians(
+            20.0
+        )  # Angle within which reward is close to 1
+        upright_reward_raw = np.exp(-abs(ox) / max_angle_for_full_reward)
         target_speed = np.clip(self.target_speed, -self.MAX_SPEED, self.MAX_SPEED)
 
-        # First check if the signs match (going in the right direction)
-        same_direction = (forward_speed * target_speed >= 0) or (
-            abs(forward_speed) < 0.05
-        )
+        # Calculate the speed error (difference)
+        speed_error = forward_speed - target_speed
 
-        # Base error is still the absolute difference
-        speed_error = abs(forward_speed - target_speed)
+        # Define the maximum possible error magnitude.
+        # If target is +MAX_SPEED, worst case is -MAX_SPEED, difference is 2*MAX_SPEED.
+        # Add a small epsilon for numerical stability if MAX_SPEED could be 0.
+        max_possible_error = 2.0 * self.MAX_SPEED + 1e-9
 
-        # Apply additional penalty for wrong direction
-        if not same_direction:
-            # Scale up the error when moving in wrong direction
-            direction_penalty = 1.0 + abs(forward_speed) / self.MAX_SPEED * 2.0
-            speed_error *= direction_penalty
+        # Use an exponential decay based on the squared error.
+        # Reward = exp(-k * (error / max_error)^2)
+        # We choose 'k' (alpha) to control how quickly the reward drops off.
+        # A value like 5 makes the reward close to zero at max_possible_error.
+        # exp(-5 * (max_possible_error / max_possible_error)^2) = exp(-5) approx 0.007
+        alpha = 5.0
+        speed_reward_raw = math.exp(-alpha * (speed_error / max_possible_error) ** 2)
 
-        # Exponential reward: 1 for zero error, decays as error increases
-        speed_reward_raw = np.exp(-2.0 * speed_error / self.MAX_SPEED)
-
-        # --- Upright Reward ---
-        # Reward for staying upright (cosine function of pitch)
-        # Max angle considered 'stable' for reward calculation (e.g., +/- 90 degrees)
-        horizontal_pitch = np.pi / 2.0
-        # Cosine reward: 1 when upright (pitch=0), 0 at max_stable_pitch and beyond.
-        upright_reward_raw = np.cos(ox) if abs(ox) < horizontal_pitch else 0.0
+        # 'speed_reward' is now between ~0 and 1.
+        # 1 when forward_speed == target_speed
+        # ~0 when forward_speed is MAX_SPEED in the opposite direction of target_speed
+        # Smoothly decreases in between.
 
         # --- Turn Tracking Reward ---
         # Target turn rate is self.target_turn (normalized, e.g., [-1, 1])
@@ -439,18 +446,25 @@ class SegwayEnv(gym.Env):
         turn_error = abs(tz - target_turn_rate)
         # Exponential reward for turn tracking
         # Adjust scaling factor (e.g., 1.0) and normalization
+        # Turn reward is subject to being at the right speed. if we're turning but we're not moving or not near the right speed,
+        # there should be less reward.
         turn_reward_raw = np.exp(-1.0 * turn_error / max_expected_turn_rate)
 
         # --- Balance Stability Reward ---
         # Penalize oscillations in roll (angular velocity around local x-axis)  # rad/s - adjust based on expected behavior
         roll_rate = abs(local_tx)
-        balance_reward_raw = np.exp(-10.0 * roll_rate / self.MAX_ROLL_RATE)
+        balance_reward_raw = np.exp(-2.0 * roll_rate / self.MAX_ROLL_RATE)
 
         # --- Combine Rewards with Weights ---
+        # Besides just weighting the rewards, we're composing them to form
+        # a hierarchical or progressive set of goals. For example, we only
+        # consider the speed reward proportionally to how well we're achieving the
+        # upright reward. Turning reward makes no sense if we're not upright or
+        # if we're not going at the speed we're intending (that's debatable though.)
         upright_reward = self.W_UPRIGHT * upright_reward_raw
-        speed_reward = self.W_SPEED * speed_reward_raw
-        turn_reward = self.W_TURN * turn_reward_raw
-        balance_reward = self.W_BALANCE * balance_reward_raw
+        speed_reward = self.W_SPEED * speed_reward_raw * upright_reward
+        turn_reward = self.W_TURN * turn_reward_raw * upright_reward * speed_reward
+        balance_reward = self.W_BALANCE * balance_reward_raw * upright_reward
 
         total_reward = upright_reward + speed_reward + turn_reward + balance_reward
 

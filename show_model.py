@@ -3,12 +3,12 @@ import os
 import sys
 import time
 
+import numpy as np
 import pybullet as p
-from numpy import rad2deg
 from rich.console import Console
 from rich.layout import Layout
 from rich.table import Table
-from stable_baselines3 import A2C
+from stable_baselines3 import PPO
 
 from pybullet_utils import add_debug_lines, get_non_fixed_joint_ids
 from segway_env import SegwayEnv
@@ -65,8 +65,8 @@ class DebugSegwayEnv(SegwayEnv):
         rewards.add_column("w_reward", style="bold", width=8, justify="right")
         rewards.add_column("r_reward", style="dim", width=8, justify="right")
         rewards.add_column("weight", style="dim", width=6, justify="right")
-        rewards.add_column("value", style="bold", width=6, justify="right")
-        rewards.add_column("target", style="bold", width=6, justify="right")
+        rewards.add_column("value", style="bold", width=12, justify="right")
+        rewards.add_column("target", style="bold", width=12, justify="right")
 
         rewards.add_row("total", fmt(info["total_reward"]))
         rewards.add_row(
@@ -82,23 +82,23 @@ class DebugSegwayEnv(SegwayEnv):
             fmt(info["turn_reward"]),
             fmt(info["turn_reward_raw"]),
             fmt(self.W_TURN),
-            fmt(rad2deg(info["turn"])),
-            fmt(rad2deg(self.target_turn)),
+            fmt(np.rad2deg(info["turn"])),
+            fmt(np.rad2deg(self.target_turn)),
         )
         rewards.add_row(
             "upright",
             fmt(info["upright_reward"]),
             fmt(info["upright_reward_raw"]),
             fmt(self.W_UPRIGHT),
-            fmt(rad2deg(info["upright_angle"])),
+            fmt(np.rad2deg(info["upright_angle"])),
         )
         rewards.add_row(
             "balance",
             fmt(info["balance_reward"]),
             fmt(info["balance_reward_raw"]),
             fmt(self.W_BALANCE),
-            fmt(rad2deg(info["roll_rate"])),
-            fmt(rad2deg(self.MAX_ROLL_RATE)),
+            fmt(np.rad2deg(info["roll_rate"])),
+            fmt(np.rad2deg(self.MAX_ROLL_RATE)),
         )
 
         pose = Table(title="Extra", show_header=True)
@@ -115,7 +115,7 @@ class DebugSegwayEnv(SegwayEnv):
 
 
 def fmt(value):
-    if isinstance(value, float):
+    if isinstance(value, (float, np.floating)):
         return f"{value:.4f}"
     elif isinstance(value, int):
         return str(value) + "....."
@@ -142,7 +142,7 @@ def load_model_from_latest_checkpoint(env):
             )
     latest_checkpoint = max(list_of_files, key=os.path.getmtime)
     print(f"Loading latest checkpoint: {latest_checkpoint}")
-    return A2C.load(latest_checkpoint, env=env)
+    return PPO.load(latest_checkpoint, env=env)
 
 
 if __name__ == "__main__":
