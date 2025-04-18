@@ -1,3 +1,4 @@
+import math
 import glob
 import os
 import sys
@@ -9,9 +10,10 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.table import Table
 from stable_baselines3 import PPO
+import numpy as np
 
 from pybullet_utils import add_debug_lines, get_non_fixed_joint_ids
-from segway_env import SegwayEnv
+from segway_env import SegwayEnv, make_segway_env
 
 
 class DebugSegwayEnv(SegwayEnv):
@@ -39,9 +41,9 @@ class DebugSegwayEnv(SegwayEnv):
     def step(self, action):
         observation, reward, terminated, done, info = super().step(action)
         self._camera_follows_segway()
-        if self.step_count % 24 == 0:
+        if self.step_count % self.STEPS_PER_SECOND == 0:
             self._print_debug_info(info)
-        return observation, reward, terminated, False, info
+        return observation, reward, terminated, done, info
 
     def _camera_follows_segway(self):
         camera_target = p.getBasePositionAndOrientation(
@@ -100,10 +102,17 @@ class DebugSegwayEnv(SegwayEnv):
             fmt(np.rad2deg(info["roll_rate"])),
             fmt(np.rad2deg(self.MAX_ROLL_RATE)),
         )
+        rewards.add_row(
+            "torque",
+            fmt(info["torque_reward"]),
+            fmt(info["torque_reward_raw"]),
+            fmt(self.W_TORQUE),
+            fmt(np.linalg.norm([info["torque_L"], info["torque_R"]])/math.sqrt(2*self.MOTOR_STALL_TORQUE)),
+        )
 
         pose = Table(title="Extra", show_header=True)
-        pose.add_column("left", style="dim")
-        pose.add_column("right", style="dim")
+        pose.add_column("left", style="dim", width=7, justify="right")
+        pose.add_column("right", style="dim", width=7, justify="right")
 
         pose.add_row(fmt(info["pwm_L"]), fmt(info["pwm_R"]))
         pose.add_row(fmt(info["torque_L"]), fmt(info["torque_R"]))
@@ -124,7 +133,7 @@ def fmt(value):
 
 
 CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_PREFIX = "segway_sac"
+CHECKPOINT_PREFIX = "segway_ppo"
 
 
 def load_model_from_latest_checkpoint(env):
@@ -147,15 +156,17 @@ def load_model_from_latest_checkpoint(env):
 
 if __name__ == "__main__":
     video_filename = sys.argv[1] if len(sys.argv) > 1 else None
-    env = DebugSegwayEnv(video_filename)
+    env = make_segway_env(base_env_cls=lambda: DebugSegwayEnv(video_filename)) #ugh
     model = load_model_from_latest_checkpoint(env)
     obs, _ = env.reset()
     terminated = False
 
     try:
-        while not terminated:
+        while True:
             action, _ = model.predict(obs, deterministic=True)
             # Step the environment - NOW info CONTAINS REWARD COMPONENTS
             obs, reward, terminated, truncated, info = env.step(action)
+            if video_filename is not None and truncated:
+                break # ugh
     finally:
         env.close()

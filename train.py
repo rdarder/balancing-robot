@@ -2,11 +2,15 @@
 import argparse  # Import argparse
 import glob
 import os
-
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.noise import NormalActionNoise
+from stable_baselines3.common.torch_layers import MlpExtractor
+from gymnasium.spaces import Box
 
-from segway_env import SegwayEnv
+from segway_env import make_segway_env
+from custom_feature_extractor import GRUFeatureExtractor
 
 # --- Argument Parsing ---
 parser = argparse.ArgumentParser(
@@ -36,9 +40,9 @@ args = parser.parse_args()
 CHECKPOINT_DIR = "checkpoints"
 TENSORBOARD_LOG_DIR = "tensorboard_logs"
 CHECKPOINT_FREQ = 20000  # <--- Adjusted frequency, depends on n_steps
-CHECKPOINT_PREFIX = "segway_ppo"  # <--- Changed prefix
-FINAL_MODEL_NAME = "segway_ppo_final"  # <--- Changed final name
-TB_LOG_NAME = "segway_ppo"  # <--- Changed TB log name
+CHECKPOINT_PREFIX = "segway_PPO"  # <--- Changed prefix
+FINAL_MODEL_NAME = "segway_PPO_final"  # <--- Changed final name
+TB_LOG_NAME = "segway_PPO"  # <--- Changed TB log name
 # --- End Configuration ---
 
 # Create directories if they don't exist
@@ -46,7 +50,7 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
 
 # Environment
-env = SegwayEnv()  # No changes needed for the environment itself
+env = make_segway_env()  # No changes needed for the environment itself
 
 # --- Determine Model Loading ---
 load_path = None
@@ -55,20 +59,18 @@ reset_num_timesteps = True  # Default to starting fresh
 
 def make_PPO_model():
     return PPO(
-        "MlpPolicy",
+        "MlpPolicy",  # Still using MlpPolicy as the base, but customizing feature extraction
         env,
-        learning_rate=7e-4,
-        n_steps=1024,  # Collect a good number of timesteps before updating
-        batch_size=64,  # Process data in small batches
-        n_epochs=10,  # Multiple passes through the data
+        learning_rate=3e-4,
+        n_epochs=10,
+        n_steps=2048,
+        batch_size=64,
         gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,  # Standard PPO clipping
-        ent_coef=0.05,  # Some entropy for exploration
-        vf_coef=0.5,
-        max_grad_norm=0.5,
         policy_kwargs={
-            "net_arch": [dict(pi=[64, 64], vf=[64, 64])],  # Separate networks
+            # "features_extractor_class": GRUFeatureExtractor, # <--- Use our custom feature extractor
+            # "features_extractor_kwargs": {'features_dim': 32, 'hidden_size': 16}, # <--- Pass arguments to the feature extractor
+            "net_arch": dict(pi=[32, 32], vf=[32, 32]),  # Policy and Value network architecture AFTER feature extraction
+            "share_features_extractor": True,
         },
         verbose=1,
         tensorboard_log=TENSORBOARD_LOG_DIR,

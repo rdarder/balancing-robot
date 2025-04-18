@@ -3,10 +3,12 @@ import time
 from collections import deque
 # /home/rdarder/dev/balancing-robot/segway_env.py
 import gymnasium as gym
+from gymnasium.wrappers.stateful_observation import FrameStackObservation
 import numpy as np
 import pybullet as p
 import pybullet_data
 from gymnasium import spaces
+from gymnasium.wrappers import NormalizeObservation, FrameStackObservation
 
 from pybullet_utils import JointsByName, LinksByName
 
@@ -18,7 +20,7 @@ class SegwayEnv(gym.Env):
     }
 
     MAX_SPEED = 1.5  # m/s
-    MAX_ROLL_RATE = 3.0  # rad/s
+    MAX_ROLL_RATE = 1.0  # rad/s
 
     # --- Motor & Gearbox Parameters ---
     MOTOR_MAX_VOLTAGE = 3.7
@@ -30,10 +32,11 @@ class SegwayEnv(gym.Env):
     OUTPUT_STALL_TORQUE = MOTOR_STALL_TORQUE * GEAR_RATIO
 
     # --- Weights for reward components ---
-    W_UPRIGHT = 0.1
-    W_SPEED = 0.3
-    W_TURN = 0.3
-    W_BALANCE = 0.3
+    W_UPRIGHT = 0.2
+    W_SPEED = 0.2
+    W_TURN = 0.2
+    W_BALANCE = 0.2
+    W_TORQUE = 0.
 
     # --- Noise Parameters (for Domain Randomization) ---
     ANGLE_NOISE_STD_DEV_PITCH_ROLL = np.radians(0.1)
@@ -43,6 +46,18 @@ class SegwayEnv(gym.Env):
     ACTION_LOW = -1.0
     ACTION_HIGH = 1.0
     FRAME_STACK_SIZE = 8
+
+
+    STEPS_PER_SECOND = 50
+    TRUNCATE_AT_SECONDS = 20.0
+    TIME_STEP = 1.0 / STEPS_PER_SECOND
+    TRUNCATE_AT_STEPS = TRUNCATE_AT_SECONDS * STEPS_PER_SECOND
+
+    GRACE_PERIOD_SECONDS = 0.4
+    GRACE_PERIOD_STEPS = int(GRACE_PERIOD_SECONDS * STEPS_PER_SECOND)
+
+    CHASSIS_CENTER_TO_AXLE_DISTANCE = 0.021 #meters, we should extract this from the model for single source of truth
+    WHEEL_RADIUS = 0.027
 
     def __init__(self, render_mode: str = "direct", is_real_time: bool = False):
         super().__init__()
@@ -54,7 +69,7 @@ class SegwayEnv(gym.Env):
         # --- Spaces and State ---
         # Observation: [ax, ay, az, gx, gy, gz, pitch_noisy, roll_noisy, yaw_noisy, target_speed, target_turn]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.FRAME_STACK_SIZE, 8), dtype=np.float32
+            low=-1.0, high=-1.0, shape=(8,), dtype=np.float32
         )
         # Action: [left_pwm, right_pwm] (normalized between -1 and 1)
         self.action_space = spaces.Box(
@@ -66,20 +81,17 @@ class SegwayEnv(gym.Env):
         self.target_speed = 0.0  # Target forward/backward speed command
         self.target_turn = 0.0  # Target turning rate command
         self.step_count = 0
+        self.last_upright_timestep = 0
+        self.last_action = [0.0, 0.0]
         # the stack should behave like a ring buffer of size self.FRAME_STACK_SIZE
-        self._observation_stack = deque(maxlen=self.FRAME_STACK_SIZE)
+        # self._observation_stack = deque(maxlen=self.FRAME_STACK_SIZE)
 
     def _load_model(self):
         self._plane_id = p.loadURDF("plane.urdf", physicsClientId=self._client_id)
-        self._initial_pos = [0, 0, 0.022]  # Slightly above ground
-        self._initial_orientation = p.getQuaternionFromEuler(
-            [-1.8, 0, 0]
-        )  # Start upright
-
         self.segway_id = p.loadURDF(
             "segway.urdf",
-            self._initial_pos,
-            self._initial_orientation,
+            [0,0,0],
+            [0,0,0,1],
             physicsClientId=self._client_id,
         )
         self.joints = JointsByName(self.segway_id, self._client_id)
@@ -90,19 +102,28 @@ class SegwayEnv(gym.Env):
 
         self._unlock_motors()
 
+    def _make_initial_position_and_orientation(self) -> tuple[np.ndarray, np.ndarray]:
+        x_angle = self.np_random.uniform(-1.8, 1.8)
+        z_angle = self.np_random.uniform(-math.pi, math.pi)
+        euler = np.array([x_angle, 0.0, z_angle], dtype=np.float32)
+        orientation = p.getQuaternionFromEuler(euler)
+        position_z = self.WHEEL_RADIUS + self.CHASSIS_CENTER_TO_AXLE_DISTANCE * math.cos(x_angle)
+        position = np.array([0, 0, position_z], dtype=np.float32)
+        return position, orientation
+
     def _unlock_motors(self):
         p.setJointMotorControl2(
             self.segway_id,
             self.left_wheel_joint,
             p.VELOCITY_CONTROL,
-            force=0,
+            force=self.MOTOR_STALL_TORQUE/10,
             physicsClientId=self._client_id,
         )
         p.setJointMotorControl2(
             self.segway_id,
             self.right_wheel_joint,
             p.VELOCITY_CONTROL,
-            force=0,
+            force=self.MOTOR_STALL_TORQUE/10,
             physicsClientId=self._client_id,
         )
 
@@ -115,8 +136,7 @@ class SegwayEnv(gym.Env):
             pybullet_data.getDataPath(), physicsClientId=self._client_id
         )
         p.setGravity(0, 0, -9.81, physicsClientId=self._client_id)
-        self.time_step = 1 / 240.0  # Ensure it's float
-        p.setTimeStep(self.time_step, physicsClientId=self._client_id)
+        p.setTimeStep(self.TIME_STEP, physicsClientId=self._client_id)
         # Optional: Improve physics simulation stability
         p.setPhysicsEngineParameter(
             numSolverIterations=10, physicsClientId=self._client_id
@@ -149,10 +169,11 @@ class SegwayEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        position, orientation = self._make_initial_position_and_orientation()
         p.resetBasePositionAndOrientation(
             self.segway_id,
-            self._initial_pos,
-            self._initial_orientation,
+            position,
+            orientation,
             physicsClientId=self._client_id,
         )
         self._reset_joints()
@@ -162,16 +183,18 @@ class SegwayEnv(gym.Env):
         self.step_count = 0
         self.prev_vel = np.zeros(3)
 
+        self.last_action = self.np_random.uniform(low=-1.0, high=1.0, size=(2,))
         # Set control targets (speed, turn)
         self.target_speed = self._get_initial_target_speed(options)
         self.target_turn = self._get_initial_target_turn(options)
         self._last_step_timestamp = time.time()
         observation = self._get_obs()  # Get initial info dictionary
-        self._observation_stack.clear()  # Clear any previous data
-        for _ in range(self.FRAME_STACK_SIZE):
-            self._observation_stack.append(observation)
+        # self._observation_stack.clear()  # Clear any previous data
+        # for _ in range(self.FRAME_STACK_SIZE):
+        #     self._observation_stack.append(observation)
 
-        return np.array(list(self._observation_stack)), {}
+        # return np.array(list(self._observation_stack)), {}
+        return observation, {}
 
     def _get_initial_target_turn(self, options):
         if options and "target_turn" in options:
@@ -184,10 +207,10 @@ class SegwayEnv(gym.Env):
 
     def _get_initial_target_speed(self, options):
         if options and "target_speed" in options:
-            return np.clip(options["target_speed"], -self.MAX_SPEED, self.MAX_SPEED)
+            return np.clip(options["target_speed"], -1, 1)
         else:
             # Random target speed within MAX_SPEED limits
-            return self.np_random.uniform(-self.MAX_SPEED, self.MAX_SPEED)
+            return self.np_random.uniform(-1, 1)
 
     def _reset_joints(self):
         for j in range(p.getNumJoints(self.segway_id, physicsClientId=self._client_id)):
@@ -225,7 +248,7 @@ class SegwayEnv(gym.Env):
         imu_velocity = np.array(sim_velocity)
 
         # Calculate acceleration
-        imu_accel = (imu_velocity - self.prev_vel) / self.time_step
+        imu_accel = (imu_velocity - self.prev_vel) / self.TIME_STEP
         self.prev_vel = (
             imu_velocity  # Store current velocity for next step's calculation
         )
@@ -245,28 +268,22 @@ class SegwayEnv(gym.Env):
         gravity_imu = rot_matrix_transposed.dot(gravity_world)
         imu_accel += gravity_imu
 
-        # --- Control Targets ---
-        # Ensure targets are clipped
-        clipped_target_speed = np.clip(
-            self.target_speed, -self.MAX_SPEED, self.MAX_SPEED
-        )
-        clipped_target_turn = np.clip(self.target_turn, -1.0, 1.0)
-        targets = np.array(
-            [clipped_target_speed, clipped_target_turn], dtype=np.float32
-        )
+        # Stack imu data
+        imu_data = np.concatenate((imu_accel, imu_angular_velocity))
 
-        # --- Concatenate Observation ---
-        # Order: IMU accel (3), IMU angular velocity (3), Noisy Fused Angles (Roll, Pitch, Yaw) (3), Targets (2) = 11 elements
-        ideal_observation = np.concatenate(
-            [imu_accel, imu_angular_velocity, targets],
+        # Add sensor noise
+        noisy_imu_data = imu_data + np.random.normal(0, 0.05, size=imu_data.shape) # Assuming standard deviation of 0.05
+
+        normalized_imu_data = normalize_imu_data(noisy_imu_data)
+
+        normalized_noisy_observation = np.concatenate(
+            [normalized_imu_data, np.array([self.target_speed, self.target_turn])],
             dtype=np.float32,
         )
 
-        # Add sensor noise
-        noisy_observation = ideal_observation * np.random.normal(
-            1.0, 0.1, size=ideal_observation.shape
-        )
-        return noisy_observation
+        clipped_normalized_noisy_obs = np.clip(normalized_noisy_observation, -1.0, 1.0)
+        return clipped_normalized_noisy_obs
+
 
     def _calculate_single_motor_torque(
         self,
@@ -341,8 +358,10 @@ class SegwayEnv(gym.Env):
 
         self._apply_torque(self.left_wheel_joint, left_final_torque)
         self._apply_torque(self.right_wheel_joint, right_final_torque)
+
         self.step_count += 1
-        self._observation_stack.append(self._get_obs())
+        observation = self._get_obs()
+        # self._observation_stack.append()
 
         velocities, angular_velocities = p.getBaseVelocity(
             self.segway_id, physicsClientId=self._client_id
@@ -352,25 +371,26 @@ class SegwayEnv(gym.Env):
         )
 
         reward_components = self._compute_reward(
-            velocities, angular_velocities, position_quat, orientation_quat
+            velocities, angular_velocities, position_quat, orientation_quat, action
         )
         total_reward = reward_components["total_reward"]
         terminated = self._check_termination(orientation_quat)
-        truncated = self.step_count >= 2400
+        truncated = self.step_count >= self.TRUNCATE_AT_STEPS
         info = self._make_info(
             reward_components, action, [left_final_torque, right_final_torque]
         )
         p.stepSimulation(self._client_id)
         self._sleep_if_real_time()
+        self.last_action = action
 
-        observation = np.array(list(self._observation_stack))
+        # observation = np.array(list(self._observation_stack))
         return observation, total_reward, terminated, truncated, info
 
     def _sleep_if_real_time(self):
         if self._is_real_time:
             elapsed = time.time() - self._last_step_timestamp
-            if elapsed < self.time_step:
-                time.sleep(self.time_step - elapsed)
+            if elapsed < self.TIME_STEP:
+                time.sleep(self.TIME_STEP - elapsed)
             self._last_step_timestamp = time.time()
 
     def _check_termination(self, orientation_quat):
@@ -378,14 +398,15 @@ class SegwayEnv(gym.Env):
         ax, ay, az = p.getEulerFromQuaternion(orientation_quat)
 
         # Check pitch angle for falling over
-        fall_threshold = np.radians(100.0)  # e.g., 100 degrees
-        # Add a grace period at the start of the episode before checking fall condition
-        grace_period_steps = 40
-        fell_over = self.step_count > grace_period_steps and abs(ax) > fall_threshold
-        return fell_over
+        fall_threshold = np.radians(90.0)
+        if abs(ax) > fall_threshold:
+            return self.step_count - self.last_upright_timestep > self.GRACE_PERIOD_STEPS
+        else:
+            self.last_upright_timestep = self.step_count
+            return False
 
     def _compute_reward(
-        self, velocities, angular_velocities, position_quat, orientation_quat
+        self, velocities, angular_velocities, position_quat, orientation_quat, action
     ):
         """Computes the reward based on uprightness, speed tracking, turn tracking, and balance stability."""
 
@@ -407,32 +428,9 @@ class SegwayEnv(gym.Env):
             0
         ]  # Local x-axis angular velocity (rolling oscillation)
 
-        max_angle_for_full_reward = np.radians(
-            20.0
-        )  # Angle within which reward is close to 1
-        upright_reward_raw = np.exp(-abs(ox) / max_angle_for_full_reward)
-        target_speed = np.clip(self.target_speed, -self.MAX_SPEED, self.MAX_SPEED)
+        upright_reward_raw = self._get_upright_reward_raw(abs(ox))
 
-        # Calculate the speed error (difference)
-        speed_error = forward_speed - target_speed
-
-        # Define the maximum possible error magnitude.
-        # If target is +MAX_SPEED, worst case is -MAX_SPEED, difference is 2*MAX_SPEED.
-        # Add a small epsilon for numerical stability if MAX_SPEED could be 0.
-        max_possible_error = 2.0 * self.MAX_SPEED + 1e-9
-
-        # Use an exponential decay based on the squared error.
-        # Reward = exp(-k * (error / max_error)^2)
-        # We choose 'k' (alpha) to control how quickly the reward drops off.
-        # A value like 5 makes the reward close to zero at max_possible_error.
-        # exp(-5 * (max_possible_error / max_possible_error)^2) = exp(-5) approx 0.007
-        alpha = 5.0
-        speed_reward_raw = math.exp(-alpha * (speed_error / max_possible_error) ** 2)
-
-        # 'speed_reward' is now between ~0 and 1.
-        # 1 when forward_speed == target_speed
-        # ~0 when forward_speed is MAX_SPEED in the opposite direction of target_speed
-        # Smoothly decreases in between.
+        speed_reward_raw = self._get_speed_reward_raw(forward_speed)
 
         # --- Turn Tracking Reward ---
         # Target turn rate is self.target_turn (normalized, e.g., [-1, 1])
@@ -448,12 +446,14 @@ class SegwayEnv(gym.Env):
         # Adjust scaling factor (e.g., 1.0) and normalization
         # Turn reward is subject to being at the right speed. if we're turning but we're not moving or not near the right speed,
         # there should be less reward.
-        turn_reward_raw = np.exp(-1.0 * turn_error / max_expected_turn_rate)
+        turn_reward_raw = np.exp(-6 * turn_error / max_expected_turn_rate)
 
         # --- Balance Stability Reward ---
         # Penalize oscillations in roll (angular velocity around local x-axis)  # rad/s - adjust based on expected behavior
         roll_rate = abs(local_tx)
-        balance_reward_raw = np.exp(-2.0 * roll_rate / self.MAX_ROLL_RATE)
+        balance_reward_raw = np.exp(-4 * roll_rate / self.MAX_ROLL_RATE)
+
+        torque_reward_raw = 0.0
 
         # --- Combine Rewards with Weights ---
         # Besides just weighting the rewards, we're composing them to form
@@ -462,9 +462,10 @@ class SegwayEnv(gym.Env):
         # upright reward. Turning reward makes no sense if we're not upright or
         # if we're not going at the speed we're intending (that's debatable though.)
         upright_reward = self.W_UPRIGHT * upright_reward_raw
-        speed_reward = self.W_SPEED * speed_reward_raw * upright_reward
-        turn_reward = self.W_TURN * turn_reward_raw * upright_reward * speed_reward
-        balance_reward = self.W_BALANCE * balance_reward_raw * upright_reward
+        torque_reward = self.W_TORQUE * torque_reward_raw
+        speed_reward = self.W_SPEED * speed_reward_raw * upright_reward_raw
+        turn_reward = self.W_TURN * turn_reward_raw * upright_reward_raw
+        balance_reward = self.W_BALANCE * balance_reward_raw * upright_reward_raw
 
         total_reward = upright_reward + speed_reward + turn_reward + balance_reward
 
@@ -479,11 +480,43 @@ class SegwayEnv(gym.Env):
             "upright_reward": upright_reward,
             "balance_reward_raw": balance_reward_raw,
             "balance_reward": balance_reward,
+            "torque_reward_raw": torque_reward_raw,
+            "torque_reward": torque_reward,
             "forward_speed": forward_speed,
             "turn": tz,
             "upright_angle": ox,
             "roll_rate": roll_rate,
         }
+
+    def _get_upright_reward_raw(self, ox):
+        min_tilt=np.radians(15)
+        max_tilt=np.radians(80)
+        tilt_range = max_tilt - min_tilt
+
+        if ox < min_tilt:
+            return 1.0
+        elif ox > max_tilt:
+            return 0.0
+        else:
+            return (math.cos((ox - min_tilt) * math.pi / tilt_range) + 1)/2
+
+
+    def _get_speed_reward_raw(self, forward_speed):
+        target_speed_ratio = np.clip(self.target_speed, -1.0, 1.0)
+
+        target_speed  = target_speed_ratio * self.MAX_SPEED
+
+        # Calculate the speed error (difference)
+        speed_error = abs(forward_speed - target_speed)
+
+        # Define the maximum possible error magnitude.
+        # If target is +MAX_SPEED, worst case is -MAX_SPEED, difference is 2*MAX_SPEED.
+        # Add a small epsilon for numerical stability if MAX_SPEED could be 0.
+        max_possible_error = 2.0 * self.MAX_SPEED + 1e-9
+
+        speed_reward_raw = math.exp(-6 * (speed_error / max_possible_error))
+        return speed_reward_raw
+
 
     def _make_info(self, reward_components, pwm, torque):
         """Gathers supplementary information about the environment state."""
@@ -521,3 +554,30 @@ class SegwayEnv(gym.Env):
             print(
                 "SegwayEnv: No active PyBullet connection to close or already disconnected."
             )
+
+
+def normalize_imu_data(imu_data: np.ndarray) -> np.ndarray:
+    """Normalizes IMU data to the range [-1, 1].
+
+    Args:
+        imu_data: A numpy array of shape (6,) containing the IMU data.
+                  The first 3 elements are accelerometer readings (m/s^2),
+                  and the last 3 elements are gyro readings (rad/s).
+
+    Returns:
+        A numpy array of shape (6,) containing the normalized IMU data.
+    """
+    acc_range = 4 * 9.81  # +-4g, where g = 9.81 m/s^2
+    gyro_range = 500  # +-500 deg/s
+    gyro_range_rad = np.deg2rad(gyro_range)  # Convert deg/s to rad/s
+
+    normalized_acc = imu_data[:3] / acc_range
+    normalized_gyro = imu_data[3:] / gyro_range_rad
+
+    return np.concatenate((normalized_acc, normalized_gyro))
+
+STACK_SIZE=16
+def make_segway_env(base_env_cls=SegwayEnv):
+    env = base_env_cls() # awful, show_model should be an env wrapper.
+    stacked = FrameStackObservation(env,stack_size=STACK_SIZE)
+    return stacked
