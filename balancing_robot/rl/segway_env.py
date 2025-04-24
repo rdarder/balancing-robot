@@ -1,6 +1,8 @@
 import math
 import time
 from collections import deque
+import pkg_resources
+
 # /home/rdarder/dev/balancing-robot/segway_env.py
 import gymnasium as gym
 from gymnasium.wrappers.stateful_observation import FrameStackObservation
@@ -10,7 +12,7 @@ import pybullet_data
 from gymnasium import spaces
 from gymnasium.wrappers import NormalizeObservation, FrameStackObservation
 
-from pybullet_utils import JointsByName, LinksByName
+from balancing_robot.rl.pybullet_utils import JointsByName, LinksByName
 
 
 class SegwayEnv(gym.Env):
@@ -36,7 +38,7 @@ class SegwayEnv(gym.Env):
     W_SPEED = 0.2
     W_TURN = 0.2
     W_BALANCE = 0.2
-    W_TORQUE = 0.
+    W_TORQUE = 0.2
 
     # --- Noise Parameters (for Domain Randomization) ---
     ANGLE_NOISE_STD_DEV_PITCH_ROLL = np.radians(0.1)
@@ -88,8 +90,9 @@ class SegwayEnv(gym.Env):
 
     def _load_model(self):
         self._plane_id = p.loadURDF("plane.urdf", physicsClientId=self._client_id)
+        model_path = pkg_resources.resource_filename("balancing_robot", "assets/segway.urdf")
         self.segway_id = p.loadURDF(
-            "segway.urdf",
+            model_path,
             [0,0,0],
             [0,0,0,1],
             physicsClientId=self._client_id,

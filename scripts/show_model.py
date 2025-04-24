@@ -1,19 +1,18 @@
 import math
-import glob
-import os
 import sys
 import time
+import pkg_resources
 
 import numpy as np
 import pybullet as p
 from rich.console import Console
 from rich.layout import Layout
 from rich.table import Table
-from stable_baselines3 import PPO
 import numpy as np
 
-from pybullet_utils import add_debug_lines, get_non_fixed_joint_ids
-from segway_env import SegwayEnv, make_segway_env
+from balancing_robot.rl.pybullet_utils import add_debug_lines, get_non_fixed_joint_ids
+from balancing_robot.rl.segway_env import SegwayEnv, make_segway_env
+from balancing_robot.rl.utils import load_model_from_latest_checkpoint
 
 
 class DebugSegwayEnv(SegwayEnv):
@@ -132,26 +131,6 @@ def fmt(value):
         return str(value)
 
 
-CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_PREFIX = "segway_ppo"
-
-
-def load_model_from_latest_checkpoint(env):
-    checkpoint_pattern = os.path.join(CHECKPOINT_DIR, f"{CHECKPOINT_PREFIX}_*.zip")
-    list_of_files = glob.glob(checkpoint_pattern)
-    if not list_of_files:
-        list_of_files = glob.glob(os.path.join(CHECKPOINT_DIR, "*.zip"))
-        if not list_of_files:
-            print(f"Error: No checkpoint files (.zip) found in {CHECKPOINT_DIR}")
-            env.close()
-            exit()
-        else:
-            print(
-                f"Warning: No checkpoints found with prefix '{CHECKPOINT_PREFIX}'. Loading latest generic checkpoint."
-            )
-    latest_checkpoint = max(list_of_files, key=os.path.getmtime)
-    print(f"Loading latest checkpoint: {latest_checkpoint}")
-    return PPO.load(latest_checkpoint, env=env)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+tensorboard_logs
+checkpoints
+recorded_videos
+mujoco-backup
+good_checkpoints/
