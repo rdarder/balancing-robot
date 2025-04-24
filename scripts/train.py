@@ -13,7 +13,7 @@ from gymnasium.spaces import Box
 
 from balancing_robot.rl.segway_env import make_segway_env
 from balancing_robot.rl.custom_feature_extractor import GRUFeatureExtractor
-from balancing_robot.rl.utils import load_model_from_latest_checkpoint_or_new, CHECKPOINTS_DIR, CHECKPOINT_PREFIX, ensure_checkpoint_and_log_directories_exist, check_and_log_remaining_train_steps, train_and_save, make_argument_parser
+from balancing_robot.rl.train_utils import load_model_from_latest_checkpoint_or_new, CHECKPOINTS_DIR, CHECKPOINT_PREFIX, ensure_checkpoint_and_log_directories_exist, check_and_log_remaining_train_steps, train_and_save, make_argument_parser
 
 # --- Argument Parsing ---
 parser = make_argument_parser()

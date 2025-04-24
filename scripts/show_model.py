@@ -12,7 +12,7 @@ import numpy as np
 
 from balancing_robot.rl.pybullet_utils import add_debug_lines, get_non_fixed_joint_ids
 from balancing_robot.rl.segway_env import SegwayEnv, make_segway_env
-from balancing_robot.rl.utils import load_model_from_latest_checkpoint
+from balancing_robot.rl.train_utils import load_model_from_latest_checkpoint
 
 
 class DebugSegwayEnv(SegwayEnv):
